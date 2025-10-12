@@ -5,6 +5,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-22.04
+
     steps:
       - uses: actions/checkout@v4
 
@@ -13,17 +14,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install playwright==1.40.0
-          playwright install --with-deps chromium
+
+      - name: Install browsers & system deps
+        uses: microsoft/playwright-github-action@v1
 
       - name: Run scraper
-        env:
-          LOCATION: "Dubai, United Arab Emirates"
-          MAX_LISTINGS: "250"   # commence à 250 pour tester
-          SCROLLS: "30"
         run: |
           python scrape_airbnb.py
 
@@ -31,4 +30,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: airbnb-dubai-csv
-          path: airbnb_dubai_listings.csv
+          path: airbnb_listings.csv
