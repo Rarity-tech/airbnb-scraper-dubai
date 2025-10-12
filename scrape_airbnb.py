@@ -3,7 +3,7 @@ import csv, re, time, random, sys
 
 # =========================
 # COLLE ICI TON URL Airbnb de recherche (avec tes filtres)
-SEARCH_URL = "COLLE_ICI_TON_URL_AIRBNB"
+SEARCH_URL = "https://www.airbnb.fr/s/Duba%C3%AF-centre~ville/homes?refinement_paths%5B%5D=%2Fhomes&acp_id=ed0ceecb-417e-4db7-a51a-b28705c30d67&date_picker_type=calendar&source=structured_search_input_header&search_type=unknown&flexible_trip_lengths%5B%5D=one_week&price_filter_input_type=2&price_filter_num_nights=9&channel=EXPLORE&place_id=ChIJg_kMcC9oXz4RBLnAdrBYzLU&query=Duba%C3%AF%20centre-ville&search_mode=regular_search"
 
 OUTPUT = "airbnb_listings.csv"
 MAX_LISTINGS = 1000        # limite maxi
