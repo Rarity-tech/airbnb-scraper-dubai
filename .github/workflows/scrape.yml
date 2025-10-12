@@ -19,8 +19,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install playwright==1.40.0
 
-      - name: Install browsers & system deps
-        uses: microsoft/playwright-github-action@v1
+      # >>> Cette étape installe Chromium + dépendances système <<<
+      - name: Install Playwright browsers
+        run: |
+          python -m playwright install --with-deps chromium
 
       - name: Run scraper
         run: |
