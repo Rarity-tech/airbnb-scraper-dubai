@@ -1,224 +1,260 @@
 # scrape_airbnb.py
-#!/usr/bin/env python3
-import os, csv, time, re, sys
-from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urlunparse
+import os, csv, re, time, datetime
+from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-START_URL   = os.getenv('START_URL', 'https://www.airbnb.com/s/Dubai/homes')
-MAX_LISTINGS= int(os.getenv('MAX_LISTINGS','20'))
-MAX_MINUTES = int(os.getenv('MAX_MINUTES','5'))
-PROXY       = os.getenv('PROXY') or None
+START_URL   = os.getenv("START_URL", "https://www.airbnb.com/s/Dubai/homes")
+MAX_LIST    = int(os.getenv("MAX_LISTINGS", "20"))
+MAX_MINUTES = float(os.getenv("MAX_MINUTES", "5"))
+PROXY       = os.getenv("PROXY", "").strip() or None
 
-OUT = 'airbnb_results.csv'
-HEADERS = [
-    'url','title','license_code','host_name',
-    'host_overall_rating','host_profile_url','host_joined','scraped_at'
-]
+# ---------- helpers ----------
 
-def clean_url(href, base):
-    if not href: return None
-    u = urljoin(base, href)
-    p = list(urlparse(u)); p[4] = ''; p[5] = ''
-    return urlunparse(p)
+def now_iso():
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
 
-def maybe_click(page, selector, timeout=2000):
+def write_csv(rows, path="airbnb_results.csv"):
+    header = [
+        "url","title","license_code",
+        "host_name","host_overall_rating","host_profile_url","host_joined","scraped_at"
+    ]
+    # UTF-8 with BOM so Excel shows accents correctly
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in header})
+
+def click_if_present(page, selector, timeout=2000):
     try:
-        loc = page.locator(selector)
-        if loc.first.is_visible(timeout=timeout):
-            loc.first.click()
+        el = page.locator(selector).first
+        if el.is_visible(timeout=timeout):
+            el.click()
             return True
+    except PWTimeout:
+        pass
     except Exception:
         pass
     return False
 
-def collect_listing_urls(page, target, deadline):
-    urls, seen = [], set()
-    while len(urls) < target and time.time() < deadline:
-        for el in page.locator('a[href*="/rooms/"]').all():
-            href = el.get_attribute('href')
-            u = clean_url(href, page.url)
-            if not u: continue
-            if '/rooms/' in u and '/photos' not in u and '/reviews' not in u:
-                if u not in seen:
-                    seen.add(u); urls.append(u)
-                    if len(urls) >= target: break
-        page.mouse.wheel(0, 2500)
-        page.wait_for_timeout(800)
+def get_text_safe(loc):
+    try:
+        return loc.inner_text(timeout=2000).strip()
+    except Exception:
+        return ""
+
+# ---------- URL collection ----------
+
+def collect_listing_urls(page, max_items, max_minutes):
+    page.goto(START_URL, wait_until="networkidle")
+    start = time.time()
+    seen = set()
+    last_h = 0
+
+    # accept cookies if present
+    click_if_present(page, 'button:has-text("Accepter")')
+    click_if_present(page, 'button:has-text("I agree")')
+    click_if_present(page, 'button:has-text("OK")')
+
+    while len(seen) < max_items and (time.time() - start) < (max_minutes * 60):
+        # collect anchors that look like listings
+        anchors = page.locator('a[href^="/rooms/"]').all()
+        for a in anchors:
+            try:
+                href = a.get_attribute("href") or ""
+                if not href:
+                    continue
+                # ignore fragment anchors to reviews/photos etc.
+                if any(x in href for x in ["experiences", "things-to-do"]):
+                    continue
+                # normalize to absolute fr/ww domain
+                full = urljoin(page.url, href.split("?")[0])
+                if "/rooms/" in full:
+                    seen.add(full)
+                    if len(seen) >= max_items:
+                        break
+            except Exception:
+                continue
+
+        # infinite scroll
+        page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+        page.wait_for_timeout(600)
+        # stop if no more scroll
+        h = page.evaluate("document.body.scrollHeight")
+        if h == last_h:
+            break
+        last_h = h
+
+    urls = list(seen)[:max_items]
+    print(f"FOUND_URLS {len(urls)}")
+    for i,u in enumerate(urls,1):
+        print(f"#{i} {u}")
     return urls
 
-REG_LABEL = re.compile(
-    r'(?:Infos?|D[ée]tails?)\s+de\s+l[\'’]enregistrement|registration|licen[cs]e|permit|enregistrement|رقم\s*(?:التسجيل|الترخيص)',
-    re.I
-)
-REG_TOKEN = re.compile(r'\b([A-Z]{2,5}(?:-[A-Z0-9]{2,6}){1,6}|\d{5,})\b')
+# ---------- PDP parsing ----------
 
-def extract_registration_code(page):
-    opened = False
-    for sel in [
-        'button:has-text("Lire la suite")',
-        'button:has-text("Afficher plus")',
-        'button:has-text("Read more")',
-        'button:has-text("Show more")'
-    ]:
-        if maybe_click(page, sel, timeout=1500):
-            opened = True
-            break
-    dialog = page.locator('[role="dialog"]').first if opened else None
-    candidates = []
+RE_LICENSES = [
+    re.compile(r"\b[A-Z]{3}-[A-Z]{3}-[A-Z0-9]{4,6}\b"),  # e.g. BUR-BUR-OFXPS
+    re.compile(r"\b\d{5,8}\b"),                          # e.g. 1100042
+    re.compile(r"\b[A-Z0-9]{5,}\b"),                     # fallback
+]
 
-    try:
-        if dialog and dialog.is_visible(timeout=2000):
-            txt = dialog.inner_text()
-            mlabel = REG_LABEL.search(txt)
-            if mlabel:
-                after = txt.split(mlabel.group(0), 1)[-1]
-                m = REG_TOKEN.search(after)
-                if m: return m.group(1).strip()
-            for m in REG_TOKEN.finditer(txt):
-                candidates.append(m.group(1))
-    except Exception:
-        pass
+LABEL_PATTERNS = [
+    "Infos d'enregistrement",
+    "Détails de l'enregistrement",
+    "Registration details",
+    "License", "Licence", "Permit"
+]
 
-    try:
-        txt = page.inner_text('body')
-        mlabel = REG_LABEL.search(txt)
-        if mlabel:
-            after = txt.split(mlabel.group(0), 1)[-1]
-            m = REG_TOKEN.search(after)
-            if m: return m.group(1).strip()
-        for m in REG_TOKEN.finditer(txt):
-            candidates.append(m.group(1))
-    except Exception:
-        pass
+def extract_license_code(page):
+    # open the about dialog if present
+    opened = (
+        click_if_present(page, 'button:has-text("Lire la suite")') or
+        click_if_present(page, 'span:has-text("Lire la suite")') or
+        click_if_present(page, 'button:has-text("Afficher plus")') or
+        click_if_present(page, 'button:has-text("Read more")')
+    )
+    text_scope = ""
+    if opened:
+        # wait for modal
+        try:
+            dlg = page.locator('[role="dialog"], [aria-modal="true"]').first
+            dlg.wait_for(state="visible", timeout=3000)
+            text_scope = get_text_safe(dlg)
+        except Exception:
+            text_scope = ""
+    if not text_scope:
+        # fallback to whole page text
+        text_scope = get_text_safe(page.locator("body"))
 
-    return candidates[0] if candidates else ''
+    # narrow to section following the label if we can
+    if any(lbl in text_scope for lbl in LABEL_PATTERNS):
+        # take substring starting at first label occurrence
+        for lbl in LABEL_PATTERNS:
+            idx = text_scope.find(lbl)
+            if idx >= 0:
+                text_scope = text_scope[idx: idx + 800]  # scan next chunk only
+                break
+
+    for rx in RE_LICENSES:
+        m = rx.search(text_scope)
+        if m:
+            return m.group(0)
+    return ""
 
 def extract_host_block(page):
-    for sel in [
-        'section:has(h2:has-text("Hôte"))',
-        'section:has(h2:has-text("Host"))',
-        '[data-section-id*="HOST"]',
-    ]:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() and loc.is_visible(timeout=2000):
-                return loc
-        except PWTimeout:
-            continue
-    return page.locator('body')
+    # Prefer the host section; avoids reviewer links.
+    candidates = [
+        'section[data-section-id^="HOST"]',
+        'section:has-text("Hôte")',
+        'section:has-text("Hosted by")',
+        '[data-plugin-in-point-id="ABOUT_HOST"]'
+    ]
+    for sel in candidates:
+        loc = page.locator(sel).first
+        if loc.count() and loc.is_visible():
+            return loc
+    return page.locator("body")
 
 def extract_host_info(page):
-    host_section = extract_host_block(page)
-
-    host_link = ''
+    host_block = extract_host_block(page)
+    # profile URL inside host block only
+    profile_a = host_block.locator('a[href^="/users/show/"]').first
+    profile_url = ""
     try:
-        a = host_section.locator('a[href*="/users/show/"]').first
-        if a and a.count():
-            host_link = clean_url(a.get_attribute('href'), page.url)
+        href = profile_a.get_attribute("href")
+        if href:
+            profile_url = urljoin(page.url, href)
+    except Exception:
+        profile_url = ""
+
+    # host name: try aria-label on the same link
+    host_name = ""
+    try:
+        aria = profile_a.get_attribute("aria-label") or ""
+        # e.g. "Profil de Samir" / "Profile of Anna"
+        m = re.search(r"(?:Profil de|Profile of)\s+(.+)", aria)
+        if m:
+            host_name = m.group(1).strip()
     except Exception:
         pass
 
-    name = ''
+    if not host_name:
+        # try heading text that contains "Hôte"
+        txt = get_text_safe(host_block)
+        m = re.search(r"H[oô]te\s*:?\s*([^\n•]+)", txt)
+        if m:
+            host_name = m.group(1).strip()
+
+    # joined year
+    host_joined = ""
+    m = re.search(r"H[oô]te depuis\s+(\d{4})", get_text_safe(host_block))
+    if m:
+        host_joined = m.group(1)
+
+    # overall rating near host block
+    host_rating = ""
+    m = re.search(r"(\d[\d.,]*)\s*/\s*5", get_text_safe(host_block))
+    if m:
+        host_rating = m.group(1).replace(",", ".")
+
+    return host_name, profile_url, host_rating, host_joined
+
+def parse_listing(page, url):
+    data = {
+        "url": url, "title": "", "license_code": "",
+        "host_name": "", "host_overall_rating": "",
+        "host_profile_url": "", "host_joined": "", "scraped_at": now_iso()
+    }
     try:
-        h2 = host_section.locator('h2').first
-        if h2 and h2.count():
-            t = h2.inner_text().strip()
-            t = re.sub(r'^(H[ôo]te\s*[:：]\s*|Host\s*[:：]\s*)', '', t, flags=re.I)
-            name = t.strip(' ·|•')
-    except Exception:
-        pass
-
-    rating = ''
-    try:
-        rtxt = host_section.inner_text()
-        m = re.search(r'([0-9]\.?[0-9]?)\s*/\s*5', rtxt)
-        if m: rating = m.group(1)
-    except Exception:
-        pass
-
-    joined = ''
-    try:
-        jtxt = host_section.inner_text()
-        m = re.search(r'(inscrit en|joined in)\s+(\d{4})', jtxt, re.I)
-        if m: joined = m.group(2)
-    except Exception:
-        pass
-
-    return name, rating, host_link, joined
-
-def scrape_listing(ctx, url):
-    page = ctx.new_page()
-    try:
-        page.goto(url, wait_until='domcontentloaded', timeout=60000)
-
-        for sel in [
-            'button:has-text("Tout accepter")',
-            'button:has-text("Accepter tout")',
-            'button:has-text("Accepter")',
-            'button:has-text("Accept all")'
-        ]:
-            maybe_click(page, sel, timeout=1500)
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        # Some pages need a short settle time
         page.wait_for_timeout(800)
 
-        try:
-            title = page.locator('h1').first.inner_text().strip()
-        except Exception:
-            title = ''
+        # title
+        title = get_text_safe(page.locator('h1[data-testid="title"]'))
+        if not title:
+            title = get_text_safe(page.locator("h1"))
+        data["title"] = title
 
-        license_code = extract_registration_code(page)
-        host_name, host_rating, host_profile, host_joined = extract_host_info(page)
+        # host info
+        hn, hp, hr, hj = extract_host_info(page)
+        data["host_name"] = hn
+        data["host_profile_url"] = hp
+        data["host_overall_rating"] = hr
+        data["host_joined"] = hj
 
-        return {
-            'url': clean_url(url, url),
-            'title': title,
-            'license_code': license_code,
-            'host_name': host_name,
-            'host_overall_rating': host_rating,
-            'host_profile_url': host_profile,
-            'host_joined': host_joined,
-            'scraped_at': datetime.now(timezone.utc).isoformat()
-        }
-    finally:
-        page.close()
+        # license code
+        data["license_code"] = extract_license_code(page)
+
+    except Exception as e:
+        print(f"ERROR parsing {url}: {e}")
+    return data
+
+# ---------- main ----------
 
 def main():
-    deadline = time.time() + MAX_MINUTES * 60
+    rows = []
+    with sync_playwright() as p:
+        launch_args = {"headless": True}
+        if PROXY:
+            launch_args["proxy"] = {"server": PROXY}
+        browser = p.chromium.launch(**launch_args)
+        context = browser.new_context(locale="fr-FR")
+        page = context.new_page()
 
-    with sync_playwright() as pw:
-        launch = {'headless': True}
-        if PROXY: launch['proxy'] = {'server': PROXY}
-        browser = pw.chromium.launch(**launch)
-        ctx = browser.new_context(locale='fr-FR')
-        page = ctx.new_page()
-        page.goto(START_URL, wait_until='domcontentloaded', timeout=60000)
-
-        # seeds
-        urls = []
-        if os.path.exists('urls.txt'):
-            with open('urls.txt') as f:
-                urls = [l.strip() for l in f if l.strip()]
-        if not urls:
-            urls = collect_listing_urls(page, MAX_LISTINGS, deadline)
-
-        print(f'FOUND_URLS {len(urls)}')
-
-        rows = []
-        for i, u in enumerate(urls, 1):
-            if time.time() > deadline: break
+        urls = collect_listing_urls(page, MAX_LIST, MAX_MINUTES)
+        for u in urls:
             try:
-                print(f'#{i} {u}')
-                rows.append(scrape_listing(ctx, u))
+                rows.append(parse_listing(page, u))
             except Exception as e:
-                print(f'ERROR {u} -> {e}', file=sys.stderr)
+                print(f"ERROR listing {u}: {e}")
 
-        with open(OUT, 'w', newline='', encoding='utf-8') as f:
-            w = csv.DictWriter(f, fieldnames=HEADERS)
-            w.writeheader()
-            for r in rows: w.writerow(r)
+        write_csv(rows)
+        print(f"SAVED {len(rows)} rows to airbnb_results.csv")
 
-        print(f'SAVED {len(rows)} rows to {OUT}')
+        context.close()
         browser.close()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
