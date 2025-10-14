@@ -19,48 +19,45 @@ def collect_listing_urls(page, target_count, deadline):
         n = anchors.count()
         for i in range(n):
             href = anchors.nth(i).get_attribute("href")
-            if not href: continue
-            if "/rooms/" not in href: continue
+            if not href:
+                continue
+            if "/rooms/" not in href:
+                continue
             if href.startswith("/"):
                 href = "https://www.airbnb.com" + href
             urls.add(href.split("?")[0])
-            if len(urls) >= target_count: break
-        # scroll pour charger plus
+            if len(urls) >= target_count:
+                break
         page.evaluate("() => window.scrollBy(0, document.body.scrollHeight)")
         time.sleep(1.2)
         tries += 1
     return list(urls)
 
 def extract_listing(page):
-    def txt(locator_css, timeout=1500):
+    def first_text(locator_css, timeout=1500):
         loc = page.locator(locator_css)
-        return loc.first.inner_text(timeout=timeout).strip() if loc.count() else ""
-    # Titre
-    title = txt("h1")
-    # Prix (heuristique)
+        if not loc.count():
+            return ""
+        try:
+            return loc.first.inner_text(timeout=timeout).strip()
+        except Exception:
+            return ""
+
+    title  = first_text("h1")
+
     price = ""
-    price_box = page.locator("[data-testid='book-it-default']")
-    if price_box.count():
-        price = price_box.inner_text(timeout=1500).strip()
-    else:
-        p = page.locator("div:has-text('AED')").first
-        price = p.inner_text(timeout=1000).strip() if p.count() else ""
-    # Hôte
-    host = ""
-    host_link = page.locator("a[href*='/users/']").first
-    if host_link.count():
+    pb = page.locator("[data-testid='book-it-default']")
+    if pb.count():
         try:
-            host = host_link.inner_text(timeout=1500).strip()
+            price = pb.first.inner_text(timeout=1500).strip()
         except Exception:
-            host = ""
-    # Note
-    rating = ""
-    r = page.locator("span[aria-label*='rated']").first
-    if r.count():
-        try:
-            rating = r.inner_text(timeout=1200).strip()
-        except Exception:
-            rating = ""
+            price = ""
+    if not price:
+        price = first_text("div:has-text('AED')")
+
+    host   = first_text("a[href*='/users/']")
+    rating = first_text("span[aria-label*='rated']")
+
     return title, price, host, rating
 
 def main():
@@ -78,19 +75,19 @@ def main():
         except PWTimeout:
             pass
 
-        # collecte des URLs
         listing_urls = collect_listing_urls(page, MAX_LIST, deadline)
 
-        # CSV header
         header = ["url","title","price_text","host","rating","scraped_at"]
         new_file = not os.path.exists(OUTPUT_CSV)
         with open(OUTPUT_CSV, "a", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            if new_file: w.writerow(header)
+            if new_file:
+                w.writerow(header)
 
             count = 0
             for url in listing_urls:
-                if datetime.utcnow() >= deadline: break
+                if datetime.utcnow() >= deadline:
+                    break
                 try:
                     page.goto(url, wait_until="domcontentloaded")
                 except PWTimeout:
@@ -99,7 +96,8 @@ def main():
                 title, price, host, rating = extract_listing(page)
                 w.writerow([url, title, price, host, rating, datetime.utcnow().isoformat()])
                 count += 1
-                if count >= MAX_LIST: break
+                if count >= MAX_LIST:
+                    break
                 time.sleep(random.uniform(1.0,2.0))
 
         browser.close()
