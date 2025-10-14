@@ -1,416 +1,276 @@
 # scrape_airbnb.py
-# -*- coding: utf-8 -*-
-import asyncio, csv, os, re, time
+import asyncio, json, re, csv, os, sys, time
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-START_URL = os.getenv("START_URL", "https://www.airbnb.com/s/Dubai/homes")
-MAX_LISTINGS = int(os.getenv("MAX_LISTINGS", "100"))
-MAX_MINUTES = int(os.getenv("MAX_MINUTES", "15"))
-PROXY = os.getenv("PROXY") or None
-OUT_CSV = os.getenv("OUT_CSV", "airbnb_results.csv")
+from playwright.async_api import async_playwright
 
-# ---------- Utilities ----------
+START_URL   = os.getenv("START_URL", "https://www.airbnb.com/s/Dubai/homes")
+MAX_LIST    = int(os.getenv("MAX_LISTINGS", "50"))
+MAX_MIN     = int(os.getenv("MAX_MINUTES", "15"))
+PROXY       = os.getenv("PROXY") or None
 
-def ts():
+# ---------- utils ----------
+
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def uniq(seq):
-    seen=set()
-    out=[]
-    for x in seq:
-        if x not in seen:
-            seen.add(x); out.append(x)
+    seen = set(); out=[]
+    for s in seq:
+        if s not in seen:
+            seen.add(s); out.append(s)
     return out
 
-HOST_KEYWORDS = re.compile(
-    r"(meet your host|rencontrez votre h[oô]te|conoce a tu anfitri[oó]n|dein gastgeber|il tuo host|seu anfitri[aã]o|conheça seu anfitri[aã]o|host|h[oô]te)",
-    re.I
-)
+def looks_like_license(s: str) -> bool:
+    s = s.strip()
+    if not s: return False
+    # accept numeric-only Dubai codes, and alphanum with dashes like BUR-BUR-OFXPS
+    return bool(re.search(r"(?:[A-Z0-9]{2,}[-\s]?){2,}[A-Z0-9]{2,}$", s, re.I)) \
+        or bool(re.fullmatch(r"\d{4,}", s)) \
+        or bool(re.search(r"(exempt|not required|n/?a)", s, re.I))
 
-RATING_NEAR_HOST = re.compile(
-    r"([0-5](?:[,.]\d{1,2})?)\s*(?:/|sur|de|von|da)?\s*5", re.I
-)
+def clean_text(s: Optional[str]) -> str:
+    if not s: return ""
+    return re.sub(r"\s+", " ", s).strip()
 
-REG_LABEL = re.compile(
-    r"(registration|enregistr|licen[cs]e|permit|dtcm|الترخيص|licencia|licença|许可|등록)", re.I
-)
+def deep_find_values(data: Any, keys_regex: str) -> List[Tuple[str, Any]]:
+    out=[]
+    key_re = re.compile(keys_regex, re.I)
+    def walk(x):
+        if isinstance(x, dict):
+            for k,v in x.items():
+                if key_re.search(k):
+                    out.append((k,v))
+                walk(v)
+        elif isinstance(x, list):
+            for v in x: walk(v)
+    walk(data)
+    return out
 
-REG_CODE = re.compile(
-    r"\b([A-Z0-9]{3,}(?:-[A-Z0-9]{2,})+|\d{4,12})\b", re.I
-)
+def first_float(s: str) -> Optional[float]:
+    m = re.search(r"(\d+(?:[.,]\d+)?)", s)
+    return float(m.group(1).replace(",", ".")) if m else None
 
-JOINED_PAT = re.compile(
-    r"(joined in|membre depuis|inscrit en|registrad[oa] en|iscritto dal|entrou em|登録|加入|mitglied seit)",
-    re.I
-)
+# ---------- core extractors ----------
 
-def absolutize(base, href):
+async def extract_via_dom(page) -> Dict[str, Optional[str]]:
+    # Title
+    title = await page.locator('[data-testid="title"], h1').first.text_content().catch(lambda _: None)
+    title = clean_text(title)
+
+    # host section root
+    host_section = page.locator('section:has-text("Meet your host"), section:has-text("Rencontrez votre hôte"), [data-section-id*="HOST_PROFILE"]').first
+
+    # host name
+    host_name = await host_section.locator('a[href*="/users/show/"], a[aria-label^="Hosted by"], a:has(> div)').first.text_content().catch(lambda _: None)
+    host_name = clean_text(host_name)
+
+    # host profile url
+    host_profile_url = await host_section.locator('a[href*="/users/show/"]').first.get_attribute("href").catch(lambda _: None)
+    if host_profile_url and host_profile_url.startswith("/"):
+        host_profile_url = "https://www.airbnb.com" + host_profile_url
+
+    # host overall rating
+    rating_text = await host_section.locator('[aria-label*="overall rating"], [aria-label*="Note globale"], [aria-label*="note"], span, div').all_text_contents().catch(lambda _: [])
+    overall = None
+    for t in rating_text:
+        v = first_float(t)
+        if v and 3.0 <= v <= 5.0:
+            overall = f"{v:.2f}"
+            break
+
+    # host joined
+    host_joined = None
+    all_text = " ".join(await host_section.all_text_contents().catch(lambda _: []))
+    m = re.search(r"(Host since|Hôte depuis)\s+([A-Za-zéû]+\.?\s*\d{4}|\d{4})", all_text, re.I)
+    if m:
+        host_joined = clean_text(m.group(2))
+
+    # license code: scan visible text around “Infos d'enregistrement / Registration / License”
+    lic = None
+    # If an “About this space/À propos de ce logement” button exists, open it to reveal the block
     try:
-        return urljoin(base, href)
-    except Exception:
-        return href
-
-async def maybe_click(page, locators, timeout=3000):
-    for sel in locators:
-        try:
-            await page.locator(sel).first.click(timeout=timeout)
-            return True
-        except Exception:
-            continue
-    return False
-
-async def dismiss_overlays(page):
-    # Cookie/consent common buttons in many languages
-    btn_texts = [
-        "Accept all", "Accept", "OK", "Agree", "Got it",
-        "Tout accepter", "Autoriser", "J'accepte", "D'accord",
-        "Aceptar", "Permitir", "Aceitar", "Accetta", "Zustimmen"
-    ]
-    sels = [f'button:has-text("{t}")' for t in btn_texts] + [
-        '[data-testid="accept-btn"]', '[aria-label*="accept"]'
-    ]
-    await maybe_click(page, sels)
-
-async def wait_idle(page):
-    try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
-    except PWTimeout:
+        btn = page.locator('button:has-text("About this space"), button:has-text("À propos de ce logement"), a:has-text("À propos de ce logement"), a:has-text("About this space")').first
+        if await btn.is_visible():
+            await btn.click()
+            # small wait for modal content
+            await page.wait_for_timeout(400)
+    except:
         pass
 
-# ---------- Extraction on listing page ----------
+    text_nodes = await page.locator('div, p, li, span').all_text_contents().catch(lambda _: [])
+    for i, t in enumerate(text_nodes):
+        t_low = t.lower()
+        if re.search(r"(registration|license|licen[cs]e|enregistrement|permit|perm[iy]t)", t_low):
+            # look ahead a few nodes for the code line
+            for j in range(i+1, min(i+6, len(text_nodes))):
+                cand = clean_text(text_nodes[j])
+                if looks_like_license(cand):
+                    lic = cand
+                    break
+        if lic: break
 
-async def extract_license_code(page):
-    # Try to open "About this place" panel if present
-    openers = [
-        'button:has-text("About this place")',
-        'button:has-text("À propos de ce logement")',
-        'text=/^About this place$/',
-        'text=/^À propos de ce logement$/',
-        '[data-testid="pdp-about-this-home"]',
-        '[data-testid="pdp-section-about-listing"]',
-        'button:has-text("Afficher plus") >> nth=0',
-        'button:has-text("Show more") >> nth=0',
-    ]
-    await maybe_click(page, openers, timeout=2000)
-    # Give modal a moment if it opened
-    await asyncio.sleep(0.5)
-
-    # Search near registration labels
-    code = None
-    try:
-        code = await page.evaluate(
-            """(REG_LABEL_SRC, REG_CODE_SRC) => {
-                const REG_LABEL = new RegExp(REG_LABEL_SRC, 'i');
-                const REG_CODE = new RegExp(REG_CODE_SRC, 'i');
-
-                function text(el){ return (el?.innerText||'').trim(); }
-
-                const all = Array.from(document.querySelectorAll('div,section,li,p,span'));
-                // 1) direct "label: code" in same node
-                for(const el of all){
-                    const t = text(el);
-                    if(!t) continue;
-                    if(REG_LABEL.test(t)){
-                        const m = t.match(REG_CODE);
-                        if(m) return m[1].trim();
-                        // 2) otherwise look in next siblings
-                        let nxt = el.nextElementSibling;
-                        let hops = 0;
-                        while(nxt && hops < 4){
-                            const tt = text(nxt);
-                            if(tt){
-                                const m2 = tt.match(REG_CODE);
-                                if(m2) return m2[1].trim();
-                            }
-                            nxt = nxt.nextElementSibling; hops++;
-                        }
-                        // 3) or look down inside el
-                        for(const sub of el.querySelectorAll('*')){
-                            const ts = text(sub);
-                            if(!ts) continue;
-                            const m3 = ts.match(REG_CODE);
-                            if(m3) return m3[1].trim();
-                        }
-                    }
-                }
-                // 4) window text fallback within 120 chars after label word
-                const body = document.body.innerText.replace(/\\s+/g,' ');
-                const lab = body.search(REG_LABEL);
-                if(lab >= 0){
-                    const snippet = body.slice(lab, lab+200);
-                    const m = snippet.match(REG_CODE);
-                    if(m) return m[1].trim();
-                }
-                return null;
-            }""",
-            REG_LABEL.pattern, REG_CODE.pattern
-        )
-    except Exception:
-        code = None
-    return code
-
-async def extract_host_block(page):
-    # Find host anchor inside the "Meet your host" area
-    result = {"host_profile_url": None, "host_name": None, "host_overall_rating": None}
-
-    try:
-        data = await page.evaluate(
-            """(HOST_KEY_RE, RATING_RE) => {
-                const HOST_RE = new RegExp(HOST_KEY_RE, 'i');
-                const RATING_RE = new RegExp(RATING_RE, 'i');
-
-                function clean(t){ return (t||'').replace(/\\s+/g,' ').trim(); }
-
-                const anchors = Array.from(document.querySelectorAll('a[href*="/users/show/"]'));
-                let hostA = null;
-
-                // Prefer anchors whose ancestors talk about the host
-                outer: for(const a of anchors){
-                    let el = a, steps = 0;
-                    while(el && steps < 6){
-                        const txt = clean(el.innerText);
-                        if(HOST_RE.test(txt)) { hostA = a; break outer; }
-                        el = el.parentElement; steps++;
-                    }
-                }
-                // Fallback: any anchor with aria-label containing host-like words
-                if(!hostA){
-                    for(const a of anchors){
-                        const al = (a.getAttribute('aria-label')||'') + ' ' + (a.title||'');
-                        if(HOST_RE.test(al)) { hostA = a; break; }
-                    }
-                }
-                // Last fallback: first /users/show/ anchor on page
-                if(!hostA) hostA = anchors[0] || null;
-
-                let host_url = hostA ? new URL(hostA.getAttribute('href'), location.origin).toString() : null;
-
-                // Host name: from nearby "Hosted by <name>" or text around anchor
-                let host_name = null;
-                if(hostA){
-                    let box = hostA;
-                    for(let i=0;i<6 && box;i++){ box = box.parentElement; }
-                    const root = box || document.body;
-                    const txt = clean(root.innerText);
-                    // Try patterns in several languages
-                    let m = txt.match(/Hosted by\\s+([^\\n•|,]+)/i) 
-                         || txt.match(/H[ôo]te[ :]*\\s*([^\\n•|,]+)/i)
-                         || txt.match(/Anfitri[óo]n[a]?[ :]*\\s*([^\\n•|,]+)/i)
-                         || txt.match(/Gastgeber[ :]*\\s*([^\\n•|,]+)/i)
-                         || txt.match(/Ospite[ :]*\\s*([^\\n•|,]+)/i);
-                    if(m) host_name = clean(m[1]);
-                    if(!host_name){
-                        // take visible text inside the anchor if it looks like a name
-                        const t = clean(hostA.innerText);
-                        if(t && t.length <= 60) host_name = t;
-                    }
-                }
-
-                // Rating: search within the same host section for "x.xx / 5"
-                let rating = null;
-                if(hostA){
-                    let sec = hostA;
-                    for(let i=0;i<6 && sec;i++){ sec = sec.parentElement; }
-                    const nodes = Array.from((sec||document.body).querySelectorAll('[aria-label],[role],span,div'));
-                    // aria-label like "4.9 out of 5"
-                    for(const n of nodes){
-                        const al = (n.getAttribute('aria-label')||'');
-                        const m = al.match(RATING_RE);
-                        if(m){ rating = m[1].replace(',', '.'); break; }
-                    }
-                    if(!rating){
-                        const txt = (sec||document.body).innerText;
-                        const m = txt.match(RATING_RE);
-                        if(m) rating = m[1].replace(',', '.');
-                    }
-                }
-
-                return {host_url, host_name, rating};
-            }""",
-            HOST_KEYWORDS.pattern, RATING_NEAR_HOST.pattern
-        )
-    except Exception:
-        data = None
-
-    if data:
-        result["host_profile_url"] = data.get("host_url")
-        result["host_name"] = data.get("host_name")
-        result["host_overall_rating"] = data.get("rating")
-
-    # Normalize
-    if result["host_overall_rating"]:
-        try:
-            result["host_overall_rating"] = str(round(float(result["host_overall_rating"].replace(',', '.')), 2))
-        except Exception:
-            result["host_overall_rating"] = None
-    return result
-
-async def extract_from_host_profile(context, host_url, current_host_name, current_rating):
-    out = {"host_name": current_host_name, "host_overall_rating": current_rating, "host_joined": None}
-    if not host_url: return out
-    p = await context.new_page()
-    try:
-        await p.goto(host_url, timeout=35000); await wait_idle(p); await dismiss_overlays(p)
-        # Joined text
-        try:
-            joined = await p.evaluate(
-                """(JOINED_PAT_SRC) => {
-                    const JP = new RegExp(JOINED_PAT_SRC, 'i');
-                    const txt = (document.body.innerText||'').replace(/\\s+/g,' ');
-                    const idx = txt.search(JP);
-                    if(idx>=0){
-                        // take up to 40 chars after the match
-                        const snip = txt.slice(idx, idx+80);
-                        // keep "Month YYYY" or just "YYYY"
-                        const m = snip.match(/(Jan\\w+|F[ée]v\\w+|Mar\\w+|Avr\\w+|Mai|Jun\\w+|Jul\\w+|Ao[ûu]t|Sep\\w+|Oct\\w+|Nov\\w+|D[ée]c\\w+|January|February|March|April|May|June|July|August|September|October|November|December)\\s+\\d{4}|\\b\\d{4}\\b/);
-                        if(m) return m[0];
-                    }
-                    return null;
-                }""",
-                JOINED_PAT.pattern
-            )
-        except Exception:
-            joined = None
-        if joined: out["host_joined"] = joined
-
-        # Host name fallback from profile header
-        if not out["host_name"]:
-            try:
-                nm = await p.locator('h1, h2').first.inner_text(timeout=2000)
-                out["host_name"] = nm.strip()
-            except Exception:
-                pass
-
-        # Rating fallback from aria-label on profile
-        if not out["host_overall_rating"]:
-            try:
-                al_nodes = await p.locator('[aria-label*="out of 5"], [aria-label*="sur 5"], [aria-label*="de 5"], [aria-label*="von 5"]').all()
-                for n in al_nodes:
-                    al = (await n.get_attribute('aria-label')) or ''
-                    m = re.search(r'([0-5](?:[.,]\d{1,2})?)', al)
-                    if m:
-                        out["host_overall_rating"] = m.group(1).replace(',', '.')
-                        break
-            except Exception:
-                pass
-    finally:
-        await p.close()
-    return out
-
-async def get_listing_urls(page, max_urls):
-    await page.goto(START_URL, timeout=45000)
-    await wait_idle(page); await dismiss_overlays(page)
-
-    urls=set()
-    t0=time.time()
-    last_height=0
-    while len(urls)<max_urls and (time.time()-t0) < MAX_MINUTES*60:
-        # collect
-        hrefs = await page.eval_on_selector_all(
-            'a[href^="/rooms/"], a[href*="/rooms/"]',
-            "els => els.map(e => e.getAttribute('href'))"
-        )
-        for h in hrefs:
-            if not h: continue
-            if "/rooms/" not in h: continue
-            # Strip query to stabilize
-            u = urljoin(page.url, h.split('?')[0])
-            urls.add(u)
-            if len(urls)>=max_urls: break
-        # scroll
-        await page.mouse.wheel(0, 2000)
-        await asyncio.sleep(0.6)
-        # break if page end
-        height = await page.evaluate("document.body.scrollHeight")
-        if height == last_height: break
-        last_height = height
-
-    return uniq(list(urls))[:max_urls]
-
-# ---------- Main ----------
-
-async def run():
-    print(f"START {START_URL}")
-    browser_args = ["--disable-blink-features=AutomationControlled"]
-    ctx_kwargs = {
-        "locale": "fr-FR",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        "accept_downloads": False,
-        "java_script_enabled": True,
-        "bypass_csp": True,
-        "viewport": {"width": 1280, "height": 900},
-        "extra_http_headers": {"Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"},
+    return {
+        "title": title or "",
+        "host_name": host_name or "",
+        "host_profile_url": host_profile_url or "",
+        "host_overall_rating": overall or "",
+        "host_joined": host_joined or "",
+        "license_code": lic or "",
     }
-    if PROXY:
-        ctx_kwargs["proxy"] = {"server": PROXY}
 
+async def extract_listing(page, url: str) -> Dict[str, str]:
+    # Collect GraphQL/JSON responses for robust parsing
+    blobs: List[Dict[str, Any]] = []
+    def on_response(resp):
+        ct = resp.headers.get("content-type", "")
+        if "application/json" in ct and ("StaysPdp" in resp.url or "/api/v3" in resp.url):
+            try:
+                blobs.append(resp.json())
+            except:
+                pass
+    page.on("response", on_response)
+
+    await page.goto(url, wait_until="domcontentloaded")
+    # late content
+    await page.wait_for_timeout(1200)
+
+    # JSON-LD as another source
+    jsonld_data=[]
+    for el in await page.locator('script[type="application/ld+json"]').all():
+        try:
+            txt = await el.text_content()
+            if txt:
+                jsonld_data.append(json.loads(txt))
+        except:
+            pass
+
+    # DOM fallback details
+    dom = await extract_via_dom(page)
+
+    # From GraphQL/JSON: license, host id, name, rating, joined
+    lic = dom["license_code"]
+    host_name = dom["host_name"]
+    host_profile_url = dom["host_profile_url"]
+    host_overall = dom["host_overall_rating"]
+    host_joined = dom["host_joined"]
+
+    # scan deep for license-like values
+    for blob in blobs + jsonld_data:
+        for k,v in deep_find_values(blob, r"license|licen[cs]e|registration|regulatory|cityRegistration"):
+            if isinstance(v, str) and looks_like_license(v):
+                lic = v.strip()
+                break
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, str) and looks_like_license(item):
+                        lic = item.strip(); break
+        if lic: break
+
+    # host id and profile
+    host_id=None
+    for blob in blobs:
+        # search for primary host id
+        for k,v in deep_find_values(blob, r"(primary_?host|hostProfile|host)"):
+            if isinstance(v, dict):
+                cand = v.get("id") or v.get("userId") or v.get("hostId")
+                if isinstance(cand, (str,int)):
+                    host_id = str(cand)
+            if not host_name and isinstance(v, dict):
+                host_name = v.get("firstName") or v.get("name") or host_name
+            if not host_overall and isinstance(v, dict):
+                rating = v.get("overallRating") or v.get("overall_rating")
+                if rating:
+                    try: host_overall = f"{float(rating):.2f}"
+                    except: pass
+            if not host_joined and isinstance(v, dict):
+                # examples: memberSince, createdAt
+                joined = v.get("memberSince") or v.get("createdAt")
+                if isinstance(joined, str):
+                    host_joined = joined[:10]
+        if host_id: break
+
+    if not host_profile_url and host_id:
+        host_profile_url = f"https://www.airbnb.com/users/show/{host_id}"
+
+    # As last resort, try JSON-LD host url/name
+    if jsonld_data:
+        def find_host(d):
+            if isinstance(d, dict):
+                if "host" in d and isinstance(d["host"], dict):
+                    return d["host"]
+                for v in d.values():
+                    x = find_host(v)
+                    if x: return x
+            if isinstance(d, list):
+                for v in d:
+                    x = find_host(v)
+                    if x: return x
+            return None
+        h=find_host(jsonld_data)
+        if h:
+            if not host_name:
+                host_name = clean_text(h.get("name"))
+            if not host_profile_url:
+                u = h.get("url")
+                if isinstance(u,str) and "/users/show/" in u:
+                    host_profile_url = u
+
+    return {
+        "url": url,
+        "title": dom["title"],
+        "license_code": lic or "",
+        "host_name": host_name or "",
+        "host_overall_rating": host_overall or "",
+        "host_profile_url": host_profile_url or "",
+        "host_joined": host_joined or "",
+        "scraped_at": now_iso(),
+    }
+
+async def collect_listing_urls(page) -> List[str]:
+    await page.goto(START_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(1200)
+    cards = page.locator('a[href*="/rooms/"]:not([href*="experiences"])')
+    hrefs = uniq([u async for u in cards.evaluate_all("els => els.map(e=>e.href)")])
+    # keep only rooms links
+    out=[u.split("?")[0] for u in hrefs if "/rooms/" in u]
+    return out[:MAX_LIST]
+
+async def main():
+    t0=time.time()
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=browser_args)
-        context = await browser.new_context(**ctx_kwargs)
+        browser = await pw.chromium.launch(headless=True)
+        context_args = dict(locale="fr-FR", user_agent="Mozilla/5.0 AirbnbScraper")
+        if PROXY:
+            context_args["proxy"]={"server":PROXY}
+        context = await browser.new_context(**context_args,
+            extra_http_headers={"Accept-Language":"fr, en;q=0.8"})
         page = await context.new_page()
 
+        urls = await collect_listing_urls(page)
+        print(f"START {START_URL}")
+        print(f"FOUND_URLS {len(urls)}")
+
         rows=[]
-        try:
-            urls = await get_listing_urls(page, MAX_LISTINGS)
-            print(f"FOUND_URLS {len(urls)}")
-            for i,u in enumerate(urls,1):
-                try:
-                    await page.goto(u, timeout=45000); await wait_idle(page); await dismiss_overlays(page)
-                    # Title
-                    try:
-                        title = (await page.locator('h1').first.inner_text(timeout=3000)).strip()
-                    except Exception:
-                        try:
-                            title = (await page.title()).strip()
-                        except Exception:
-                            title = ""
+        for i,u in enumerate(urls,1):
+            if (time.time()-t0)/60.0 > MAX_MIN: break
+            try:
+                row = await extract_listing(page, u)
+                print(f"[{i}/{len(urls)}] {u} | host={row['host_name'] or '?'} | lic={row['license_code'] or '?'} | rating={row['host_overall_rating'] or '?'}")
+                rows.append(row)
+            except Exception as e:
+                print(f"[{i}/{len(urls)}] {u} | ERROR {e}")
+        await context.close(); await browser.close()
 
-                    # Host block
-                    host_blk = await extract_host_block(page)
-                    host_url = host_blk.get("host_profile_url")
-                    host_name = host_blk.get("host_name")
-                    host_rating = host_blk.get("host_overall_rating")
-
-                    # License code
-                    license_code = await extract_license_code(page)
-
-                    # Fallback enrichment from host profile if needed
-                    if host_url or (not host_rating) or (not host_name):
-                        enrich = await extract_from_host_profile(context, host_url, host_name, host_rating)
-                        host_name = enrich.get("host_name") or host_name
-                        host_rating = enrich.get("host_overall_rating") or host_rating
-                        host_joined = enrich.get("host_joined")
-                    else:
-                        host_joined = None
-
-                    row = {
-                        "url": u,
-                        "title": title,
-                        "license_code": license_code or "",
-                        "host_name": host_name or "",
-                        "host_overall_rating": host_rating or "",
-                        "host_profile_url": host_url or "",
-                        "host_joined": host_joined or "",
-                        "scraped_at": ts(),
-                    }
-                    rows.append(row)
-                    print(f"[{i}/{len(urls)}] {u} | host={row['host_name'] or '?'} | lic={row['license_code'] or '?'} | rating={row['host_overall_rating'] or '?'}")
-                except Exception as e:
-                    print(f"[{i}/{len(urls)}] {u} ERROR {e}")
-
-        finally:
-            await context.close()
-            await browser.close()
-
-        # Write CSV
-        fieldnames = ["url","title","license_code","host_name","host_overall_rating","host_profile_url","host_joined","scraped_at"]
-        with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            for r in rows: w.writerow(r)
-        print(f"SAVED {len(rows)} rows to {OUT_CSV}")
+    # write CSV
+    fp = Path("airbnb_results.csv")
+    with fp.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["url","title","license_code","host_name","host_overall_rating","host_profile_url","host_joined","scraped_at"])
+        w.writeheader()
+        for r in rows: w.writerow(r)
+    print(f"SAVED {len(rows)} rows to {fp.name}")
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
