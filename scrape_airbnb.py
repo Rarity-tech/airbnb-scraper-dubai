@@ -1,342 +1,229 @@
-# scrape_airbnb.py
-# Python 3.11 + Playwright 1.55
-import asyncio, csv, os, re, sys, time
+# filename: scrape_airbnb_listings.py
+# deps: pip install playwright && playwright install chromium
+import asyncio, csv, json, os, re, sys, time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from pathlib import Path
+from typing import List, Optional, Tuple
+from playwright.async_api import async_playwright, Page, TimeoutError as PWTimeout
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+OUT_CSV = os.getenv("OUT_CSV", "airbnb_results.csv")
+INPUT_TXT = os.getenv("INPUT_TXT", "urls.txt")
+HEADLESS = os.getenv("HEADLESS", "1") != "0"
+NAV_TIMEOUT = int(os.getenv("NAV_TIMEOUT_MS", "45000"))
 
-START_URL   = os.getenv("START_URL", "https://www.airbnb.com/s/Dubai/homes")
-MAX_LIST    = int(os.getenv("MAX_LISTINGS", "50"))
-MAX_MIN     = float(os.getenv("MAX_MINUTES", "10"))
-PROXY       = os.getenv("PROXY", "").strip()
-
-OUT_CSV = "airbnb_results.csv"
-
-# ---- utils ------------------------------------------------------------------
+# --- helpers -----------------------------------------------------------------
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def uniq(seq: List[str]) -> List[str]:
-    s, out = set(), []
-    for x in seq:
-        if x and x not in s:
-            s.add(x); out.append(x)
-    return out
+def csv_writer(path: str):
+    first = not Path(path).exists()
+    f = open(path, "a", newline="", encoding="utf-8")
+    w = csv.writer(f)
+    if first:
+        w.writerow(["url","title","license_code","host_name",
+                    "host_overall_rating","host_profile_url",
+                    "host_joined","scraped_at"])
+    return f, w
 
-def absolutize(base: str, href: Optional[str]) -> Optional[str]:
-    if not href:
+async def safe_text(page: Page, selector: str) -> Optional[str]:
+    try:
+        el = page.locator(selector).first
+        await el.wait_for(state="attached", timeout=3000)
+        txt = (await el.text_content()) or ""
+        return txt.strip() or None
+    except Exception:
         return None
-    return urljoin(base, href)
 
-def extract_rating(text: str) -> Optional[float]:
-    t = text.replace(",", ".")
-    nums = re.findall(r"(\d\.\d{1,2})", t)
-    for s in nums:
+async def click_if_visible(page: Page, selectors: List[str]):
+    for sel in selectors:
         try:
-            f = float(s)
-            if 3.5 <= f <= 5.0:
-                return round(f, 2)
-        except:  # noqa
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=1000)
+        except Exception:
             pass
-    return None
 
-_LICENSE_MARKERS = [
-    r"Infos? d['’]enregistrement",
-    r"Information[s]?\s+d['’]enregistrement",
-    r"Registration info",
-    r"Registration information",
-    r"License(?: number)?",
-    r"Licence(?: number)?",
-    r"许可|허가|ライセンス|رقم[ \u00A0]?الرخصة|التسجيل",
+LICENSE_PATTERNS = [
+    r"(?:licen[cs]e|licen[cs]e\s*number|registration(?:\s*number)?|permit(?:\s*number)?)\s*[:\-]?\s*([A-Z0-9\-\/_. ]{4,})",
+    r"(?:num[eé]ro\s*d['e]nregistrement|num[eé]ro\s*de\s*licence)\s*[:\-]?\s*([A-Z0-9\-\/_. ]{4,})",
+    r"(?:DTCM|DED|RERA|Tourism|Dubai\s*Tourism)\s*[:\-]?\s*([A-Z0-9\-\/_.]{4,})",
 ]
 
-def _sanitize_line(s: str) -> str:
-    s = s.strip()
-    # only keep reasonable characters for codes
-    s = re.sub(r"[^\w\s\-\/\.]", "", s, flags=re.U)
-    return s.strip()
-
-def extract_license_from_text(text: str) -> Optional[str]:
-    if not text:
-        return None
-    # try: marker then the next non-empty line
-    for m in _LICENSE_MARKERS:
-        p = re.compile(m + r"\s*[\r\n]+([^\r\n]+)", re.I | re.U)
-        k = p.search(text)
-        if k:
-            line = _sanitize_line(k.group(1))
-            if len(line) >= 3:
-                return line
-    # fallback: look for typical Dubai patterns anywhere in text
-    t = text.replace("\u200f", " ")
-    m = re.search(r"\b[A-Z]{3}-[A-Z]{3}-[A-Z0-9]{3,}\b", t)
-    if m:
-        return m.group(0)
-    m = re.search(r"\b\d{5,}\b", t)  # simple numeric like 1446477
-    if m:
-        return m.group(0)
-    return None
-
-HOST_HEADERS = [
-    "Meet your host", "Meet your Host", "Hosted by", "Host details",
-    "Rencontrez votre hôte", "Animé par", "Hôte :", "Profil de l’hôte",
-    "Conoce a tu anfitrión", "Incontra il tuo host", "Lerne deinen Gastgeber kennen",
-    "Conheça seu anfitrião", "Leer je host kennen", "Ev sahibinizle tanışın",
-    "Познакомьтесь с хозяином", "تعرّف على مضيفك",
+JOINED_PATTERNS = [
+    r"Joined\s+in\s+(\d{4})",
+    r"Membre\s+depuis\s+(\d{4})",
+    r"Se\s+uni[oó]\s+en\s+(\d{4})",
+    r"Mitglied\s+seit\s+(\d{4})",
+    r"加入于\s*(\d{4})",
 ]
 
-def build_host_section_selector() -> str:
-    parts = [f"section:has-text('{t}')" for t in HOST_HEADERS]
-    # add a generic fallback that still contains a user profile link
-    parts.append("section:has(a[href*='/users/show/'])")
-    return ", ".join(parts)
+RATING_PATTERNS = [
+    r"(\d+(?:[.,]\d+)?)\s*(?:out of|sur)\s*5",
+    r"([4-5](?:[.,]\d+)?)\s*[★⭐]",
+]
 
-async def safe_text(loc) -> Optional[str]:
+def find_by_regex(text: str, patterns: List[str]) -> Optional[str]:
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+async def extract_json_ld(page: Page) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (title, rating, host_name) if present in JSON-LD."""
     try:
-        t = await loc.inner_text()
-        return (t or "").strip()
-    except:
-        return None
+        scripts = page.locator('script[type="application/ld+json"]')
+        n = await scripts.count()
+        title = rating = host = None
+        for i in range(n):
+            raw = await scripts.nth(i).text_content()
+            if not raw:
+                continue
+            # Some pages contain multiple JSON objects concatenated
+            for blob in re.findall(r"\{.*?\}(?=\s*\{|\s*$)", raw, flags=re.S):
+                try:
+                    data = json.loads(blob)
+                except Exception:
+                    continue
+                if isinstance(data, dict):
+                    if not title and isinstance(data.get("name"), str):
+                        title = data["name"].strip()
+                    if not rating:
+                        agg = data.get("aggregateRating") or {}
+                        val = agg.get("ratingValue")
+                        if isinstance(val, (int, float, str)):
+                            rating = str(val).strip()
+                    if not host:
+                        prov = data.get("provider") or data.get("author") or {}
+                        name = prov.get("name")
+                        if isinstance(name, str):
+                            host = name.strip()
+        return title, rating, host
+    except Exception:
+        return None, None, None
 
-async def click_if_exists(page, selector: str, timeout: float = 2000) -> bool:
+async def accept_gates(page: Page):
+    # Consent / language / login gates best-effort
+    await click_if_visible(page, [
+        'button:has-text("Accept")',
+        'button:has-text("I agree")',
+        'button:has-text("Tout accepter")',
+        'button:has-text("Accepter")',
+        'button[aria-label="Close"]',
+        'button:has-text("OK")',
+        'button:has-text("Got it")',
+    ])
+
+async def extract_listing(page: Page, url: str) -> dict:
+    await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
+    await accept_gates(page)
+    # Let dynamic parts settle a bit
     try:
-        btn = page.locator(selector)
-        if await btn.first.is_visible(timeout=timeout):
-            await btn.first.click()
-            return True
-    except:
-        pass
-    return False
-
-# ---- scraping primitives -----------------------------------------------------
-
-async def collect_listing_urls(page) -> List[str]:
-    await page.goto(START_URL, wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle")
-
-    # lazy load a bit
-    for _ in range(8):
-        await page.mouse.wheel(0, 2400)
-        await page.wait_for_timeout(350)
-
-    # grab anchors to /rooms/
-    hrefs: List[str] = await page.locator("a[href*='/rooms/']").evaluate_all(
-        "els => Array.from(new Set(els.map(e => e.href.split('#')[0].split('?')[0]).filter(u => u.includes('/rooms/'))))"
-    )
-    # prefer non-experiences
-    hrefs = [u for u in hrefs if "/experiences/" not in u]
-    return hrefs[:MAX_LIST]
-
-async def get_host_joined(context, host_url: str) -> Optional[str]:
-    if not host_url:
-        return None
-    p = await context.new_page()
-    try:
-        await p.goto(host_url, wait_until="domcontentloaded", timeout=15000)
-        await p.wait_for_load_state("networkidle")
-        # possible texts
-        joined_txt = await safe_text(p.locator("text=/Joined in/i, text=/Membre depuis/i, text=/Inscrit en/i"))
-        if joined_txt:
-            # extract year or month-year
-            m = re.search(r"(Joined in|Membre depuis|Inscrit en)\s+([A-Za-zÀ-ÿ]+)?\s*(\d{4})", joined_txt, re.I)
-            if m:
-                month = (m.group(2) or "").strip()
-                year = m.group(3)
-                return (month + " " + year).strip()
-        # fallback: scan whole page
-        body = await safe_text(p.locator("body"))
-        if body:
-            m = re.search(r"(Joined in|Membre depuis|Inscrit en)\s+([A-Za-zÀ-ÿ]+)?\s*(\d{4})", body, re.I)
-            if m:
-                month = (m.group(2) or "").strip()
-                year = m.group(3)
-                return (month + " " + year).strip()
-        return None
-    except:
-        return None
-    finally:
-        await p.close()
-
-async def extract_from_listing(context, url: str) -> Dict[str, Any]:
-    page = await context.new_page()
-    blobs: List[Any] = []
-
-    async def on_response(resp):
-        try:
-            ct = resp.headers.get("content-type", "")
-        except:
-            ct = ""
-        if "application/json" in ct and ("/api/" in resp.url or "graphql" in resp.url or "StaysPdp" in resp.url):
-            try:
-                j = await resp.json()
-                blobs.append(j)
-            except:
-                pass
-
-    page.on("response", on_response)
-
-    title = None
-    license_code = None
-    host_name = None
-    host_profile_url = None
-    host_overall_rating: Optional[float] = None
-    host_joined = None
-
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        # cookies / banners
-        await click_if_exists(page, "button:has-text('Accept')") or await click_if_exists(page, "button:has-text('Accepter')")
-        await page.wait_for_load_state("networkidle")
-
-        # title
-        try:
-            title = await safe_text(page.locator("[data-testid='title'], h1").first)
-        except:
-            title = None
-
-        # open description modal if present to expose "Infos d'enregistrement"
-        opened = await click_if_exists(page, "button:has-text('Show more')") or await click_if_exists(page, "button:has-text('Afficher plus')")
-        if opened:
-            await page.wait_for_timeout(400)
-
-        # scan visible containers for license code
-        about_container = page.locator("div[role='dialog'], section:has(h2:has-text('About')), section:has(h2:has-text('A propos')), section:has(h2:has-text('À propos'))")
-        txt = await safe_text(about_container) or await safe_text(page.locator("main"))
-        license_code = extract_license_from_text(txt or "")
-
-        # fallback: try JSON blobs
-        if not license_code and blobs:
-            try:
-                dumped = str(blobs)
-                license_code = extract_license_from_text(dumped)
-            except:
-                pass
-
-        # close modal if any
-        await click_if_exists(page, "div[role='dialog'] button[aria-label*='Close']") or await click_if_exists(page, "div[role='dialog'] button")
-
-        # host section
-        host_section_sel = build_host_section_selector()
-        host_section = page.locator(host_section_sel).first
-
-        if await host_section.is_visible(timeout=5000):
-            sec_text = (await safe_text(host_section)) or ""
-            # profile url
-            try:
-                href = await host_section.locator("a[href*='/users/show/']").first.get_attribute("href")
-                host_profile_url = absolutize(url, href)
-            except:
-                host_profile_url = None
-
-            # host name
-            m = re.search(r"(Hosted by|Hôte\s*:|Animé par)\s+([^\n·|,]+)", sec_text, re.I)
-            if m:
-                host_name = m.group(2).strip()
-            else:
-                # try anchor text
-                host_name = (await safe_text(host_section.locator("a[href*='/users/show/']").first)) or None
-                if host_name:
-                    host_name = re.sub(r"\s+", " ", host_name).strip()
-
-            # rating
-            host_overall_rating = extract_rating(sec_text)
-
-        # if still missing rating, try generic rating element in the host card
-        if host_overall_rating is None:
-            try:
-                rr = await safe_text(page.locator("section:has(a[href*='/users/show/']) span:has-text('·')").first)
-                host_overall_rating = extract_rating(rr or "")
-            except:
-                pass
-
-        # joined date (from host card if present, else profile)
-        if host_section and await host_section.is_visible():
-            sec_text = (await safe_text(host_section)) or ""
-            m = re.search(r"(Joined in|Membre depuis|Inscrit en)\s+([A-Za-zÀ-ÿ]+)?\s*(\d{4})", sec_text, re.I)
-            if m:
-                month = (m.group(2) or "").strip()
-                year = m.group(3)
-                host_joined = (month + " " + year).strip()
-
-        if not host_joined and host_profile_url:
-            host_joined = await get_host_joined(context, host_profile_url)
-
+        await page.wait_for_load_state("networkidle", timeout=8000)
     except PWTimeout:
         pass
+
+    # Title
+    title_json, rating_json, host_json = await extract_json_ld(page)
+    title = title_json or (await safe_text(page, "h1")) or (await safe_text(page, "title"))
+
+    # Host block
+    host_name = host_json
+    if not host_name:
+        # Common host card selectors
+        host_name = await safe_text(page, '[data-testid="user-profile-name"]') \
+                    or await safe_text(page, 'a[href*="/users/show/"]') \
+                    or await safe_text(page, 'a[aria-label^="H\u00f4te"], a[aria-label^="Host"]')
+
+    # Host profile URL
+    host_profile_url = None
+    try:
+        host_link = page.locator('a[href*="/users/show/"]').first
+        if await host_link.count() > 0:
+            host_profile_url = await host_link.get_attribute("href")
+            if host_profile_url and host_profile_url.startswith("/"):
+                host_profile_url = "https://www.airbnb.com" + host_profile_url
     except Exception:
         pass
-    finally:
-        try:
-            await page.close()
-        except:
-            pass
+
+    # Host joined year (best-effort from visible text)
+    page_text = (await page.content()) or ""
+    host_joined = find_by_regex(page_text, JOINED_PATTERNS)
+
+    # Rating
+    host_overall_rating = rating_json
+    if not host_overall_rating:
+        # aria-label like "4,87 sur 5"
+        aria_labels = await page.locator('[aria-label*="sur 5"], [aria-label*="out of 5"]').all_attribute_values("aria-label")
+        joined = " ".join([a for a in aria_labels if a]) if aria_labels else ""
+        host_overall_rating = find_by_regex(joined, RATING_PATTERNS)
+        if not host_overall_rating:
+            host_overall_rating = find_by_regex(page_text, RATING_PATTERNS)
+
+    # License / registration code
+    # Look in obvious “Permit/License/Registration” sections first
+    license_code = None
+    try:
+        # Airbnb often renders a key-value row; scan visible text blocks
+        blocks = await page.locator("section, div, li").all_inner_texts()
+        big_txt = "\n".join(blocks)
+        license_code = find_by_regex(big_txt, LICENSE_PATTERNS)
+    except Exception:
+        pass
+    if not license_code:
+        license_code = find_by_regex(page_text, LICENSE_PATTERNS)
 
     return {
         "url": url,
         "title": (title or "").strip(),
-        "license_code": license_code or "",
+        "license_code": (license_code or "").strip(),
         "host_name": (host_name or "").strip(),
-        "host_overall_rating": f"{host_overall_rating:.2f}" if isinstance(host_overall_rating, float) else "",
-        "host_profile_url": host_profile_url or "",
-        "host_joined": host_joined or "",
+        "host_overall_rating": (host_overall_rating or "").replace(",", ".").strip(),
+        "host_profile_url": (host_profile_url or "").strip(),
+        "host_joined": (host_joined or "").strip(),
         "scraped_at": now_iso(),
     }
 
-# ---- main -------------------------------------------------------------------
+# --- main --------------------------------------------------------------------
 
-async def run() -> None:
-    started = time.time()
-    launch_opts = {
-        "headless": True,
-        "args": ["--disable-dev-shm-usage"],
-    }
-    if PROXY:
-        launch_opts["proxy"] = {"server": PROXY}
-
+async def run(urls: List[str]):
+    f, writer = csv_writer(OUT_CSV)
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(**launch_opts)
-        context = await browser.new_context(viewport={"width": 1280, "height": 900})
+        browser = await pw.chromium.launch(headless=HEADLESS, args=["--no-sandbox"])
+        context = await browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120 Safari/537.36"),
+            locale="fr-FR",
+            viewport={"width": 1280, "height": 900},
+        )
         page = await context.new_page()
-
-        print(f"START {START_URL}")
-        try:
-            urls = await collect_listing_urls(page)
-        except Exception as e:
-            print("Failed to collect URLs:", e)
-            urls = []
-
-        urls = uniq(urls)[:MAX_LIST]
-        print(f"FOUND_URLS {len(urls)}")
-
-        rows: List[Dict[str, Any]] = []
-        for idx, u in enumerate(urls, 1):
-            if (time.time() - started) / 60.0 > MAX_MIN:
-                break
-            rec = await extract_from_listing(context, u)
-            rows.append(rec)
-            print(f"[{idx}/{len(urls)}] {u} | host={rec['host_name']} | lic={rec['license_code']} | rating={rec['host_overall_rating']}")
-
+        for i, url in enumerate(urls, 1):
+            try:
+                print(f"[{i}/{len(urls)}] {url}")
+                row = await extract_listing(page, url)
+                writer.writerow([row[k] for k in ["url","title","license_code","host_name",
+                                                  "host_overall_rating","host_profile_url",
+                                                  "host_joined","scraped_at"]])
+                f.flush()
+            except Exception as e:
+                print(f"ERROR {url}: {e}")
         await context.close()
         await browser.close()
+    f.close()
+    print(f"SAVED {len(urls)} rows to {OUT_CSV}")
 
-    # write CSV
-    fieldnames = ["url","title","license_code","host_name","host_overall_rating","host_profile_url","host_joined","scraped_at"]
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-    print(f"SAVED {len(rows)} rows to {OUT_CSV}")
-
-def main():
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        sys.exit(130)
+def read_urls_from_txt(path: str) -> List[str]:
+    if not Path(path).exists():
+        print(f"Missing {path}. Create it with one URL per line.")
+        return []
+    urls = [ln.strip() for ln in Path(path).read_text(encoding="utf-8").splitlines()
+            if ln.strip() and ln.strip().startswith("http")]
+    return urls
 
 if __name__ == "__main__":
-    main()
+    urls = sys.argv[1:] if len(sys.argv) > 1 else read_urls_from_txt(INPUT_TXT)
+    if not urls:
+        print("No URLs provided.")
+        sys.exit(0)
+    asyncio.run(run(urls))
