@@ -1,27 +1,55 @@
-name: Scrape Airbnb Dubai
+name: Airbnb Scrape
+
 on:
   workflow_dispatch:
+    inputs:
+      start_url:
+        description: "URL de recherche Airbnb"
+        default: "https://www.airbnb.com/s/Dubai/homes"
+        required: true
+      max_listings:
+        description: "Nombre max d'annonces"
+        default: "10"
+        required: true
+      max_minutes:
+        description: "Durée max (minutes)"
+        default: "10"
+        required: true
+      proxy:
+        description: "Proxy (optionnel), ex: http://user:pass@host:port"
+        default: ""
+        required: false
 
 jobs:
-  scrape:
-    runs-on: ubuntu-22.04
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install Python deps
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install playwright==1.40.0
-      - name: Install Playwright browsers
-        run: |
+          python -m pip install -r requirements.txt
           python -m playwright install --with-deps chromium
+
       - name: Run scraper
+        env:
+          START_URL: ${{ inputs.start_url }}
+          MAX_LISTINGS: ${{ inputs.max_listings }}
+          MAX_MINUTES: ${{ inputs.max_minutes }}
+          PROXY: ${{ inputs.proxy }}
         run: |
           python scrape_airbnb.py
-      - name: Upload CSV
+
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: airbnb-dubai-csv
-          path: airbnb_listings.csv
+          name: airbnb_results
+          path: airbnb_results.csv
+          if-no-files-found: warn
