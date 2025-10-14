@@ -1,247 +1,256 @@
 # scrape_airbnb.py
-import os, csv, json, re, time
-from urllib.parse import urljoin
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import asyncio, csv, os, re, sys
+from datetime import datetime
+from urllib.parse import urljoin, urlparse
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-START_URL   = os.getenv("START_URL", "https://www.airbnb.com/s/Dubai/homes")
+START_URL    = os.getenv("START_URL", "https://www.airbnb.com/s/Dubai/homes")
 MAX_LISTINGS = int(os.getenv("MAX_LISTINGS", "50"))
 MAX_MINUTES  = int(os.getenv("MAX_MINUTES", "10"))
-PROXY        = os.getenv("PROXY", "").strip() or None
+PROXY        = os.getenv("PROXY", "").strip()  # format: http://user:pass@host:port
 
-CSV_PATH = "airbnb_results.csv"
+# ---------------------------
+# Helpers robustes
+# ---------------------------
 
-def deep_find(obj, keys):
-    """Return first value for any of keys found anywhere in nested dict/list."""
-    stack = [obj]
-    seen = set()
-    while stack:
-        cur = stack.pop()
-        if id(cur) in seen: 
+LICENSE_PATTERNS = [
+    r"(license\s*(number|no\.?)\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+    r"(num[eé]ro\s+de\s+licen[cs]e\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+    r"(registration\s*(number|no\.?)\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+    r"(permit\s*(number|no\.?)\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+    r"(dtcm\s*(permit|license)\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+    r"(dubai\s*tourism\s*(permit|license)\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+    r"(num[eé]ro\s+d['’]enregistrement\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+    r"(enregistrement\s*n[ou]m[eé]ro\s*:?[\s\n]*)([A-Za-z0-9\-_/\. ]{3,})",
+]
+
+HOST_JOINED_PAT = re.compile(r"(Joined in|A rejoint Airbnb en)\s+(\d{4})", re.I)
+RATING_PATTERNS = [
+    # profil hôte en anglais
+    r"(Average rating|Host rating)\s*[:\s]\s*(\d\.\d)",
+    # formats compacts "4.9 · 128 reviews" mais sur le PROFIL
+    r"\b(\d\.\d)\s*[·•]\s*\d+\s+(reviews|avis)\b",
+    # français
+    r"(Note moyenne|Note de l['’]h[ôo]te)\s*[:\s]\s*(\d\.\d)",
+]
+
+ROOM_URL_RE = re.compile(r"/rooms/\d+")
+
+def normalize_whitespace(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def extract_first(patterns, text):
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.I)
+        if not m:
             continue
-        seen.add(id(cur))
-        if isinstance(cur, dict):
-            for k, v in cur.items():
-                lk = k.lower()
-                if lk in keys:
-                    return v
-            stack.extend(cur.values())
-        elif isinstance(cur, list):
-            stack.extend(cur)
-    return None
+        # dernière capture supposée contenir la valeur
+        val = m.group(m.lastindex) if m.lastindex else m.group(0)
+        return normalize_whitespace(val)
+    return ""
 
-def get_next_data_html(html):
-    m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S | re.I)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(1))
-    except json.JSONDecodeError:
-        return None
-
-def get_ld_json_all(html):
-    out = []
-    for m in re.finditer(r'<script[^>]+type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S | re.I):
-        try:
-            block = json.loads(m.group(1).strip())
-            out.append(block)
-        except Exception:
-            continue
-    return out
-
-def clean(s):
-    if not s:
+def clean_license(lic: str) -> str:
+    if not lic:
         return ""
-    # Collapse whitespace and long CTAs
-    s = re.sub(r'\s+', ' ', str(s)).strip()
-    return s[:1000]
+    # supprimer préfixes textuels résiduels
+    lic = re.sub(r"^(license|num[eé]ro.*licen[cs]e|registration|permit|dtcm|dubai tourism|enregistrement)\s*(number|no\.?)?\s*[:\-]?\s*", "", lic, flags=re.I)
+    lic = normalize_whitespace(lic)
+    # couper aux sauts ou ponctuation forte
+    lic = re.split(r"[|·•\n\r]", lic)[0]
+    return lic.strip(" :.-")
 
-def collect_listing_urls(page, limit):
-    urls = []
-    seen = set()
-    start = time.time()
-    while len(urls) < limit and (time.time() - start) < MAX_MINUTES * 60:
-        page.wait_for_timeout(400)
-        for a in page.locator('a[href*="/rooms/"]').all():
+# ---------------------------
+# Scraping
+# ---------------------------
+
+async def collect_listing_urls(page, max_urls: int):
+    urls, seen, stagnant = [], set(), 0
+    while len(urls) < max_urls and stagnant < 8:
+        anchors = await page.query_selector_all("a[href*='/rooms/']")
+        added = 0
+        for a in anchors:
+            href = await a.get_attribute("href")
+            if not href:
+                continue
+            # rendre absolu
+            if href.startswith("/"):
+                href = urljoin("https://www.airbnb.com", href)
+            # nettoyer query
             try:
-                href = a.get_attribute("href")
-                if not href:
-                    continue
-                # unify and filter
-                if "/rooms/" in href:
-                    full = urljoin("https://www.airbnb.com/", href.split("?")[0])
-                    if full not in seen:
-                        seen.add(full)
-                        urls.append(full)
-                        if len(urls) >= limit:
-                            break
+                path = urlparse(href).path
             except Exception:
                 continue
-        # scroll to load more
-        page.mouse.wheel(0, 2000)
-    return urls[:limit]
+            m = ROOM_URL_RE.search(path or "")
+            if not m:
+                continue
+            room_url = "https://www.airbnb.com" + m.group(0)
+            if room_url not in seen:
+                seen.add(room_url)
+                urls.append(room_url)
+                added += 1
+                if len(urls) >= max_urls:
+                    break
+        if added == 0:
+            stagnant += 1
+        else:
+            stagnant = 0
+        await page.mouse.wheel(0, 2200)
+        await page.wait_for_timeout(750)
+    return urls[:max_urls]
 
-def parse_from_structured(html):
-    data = {
+async def click_cookies(page):
+    try:
+        await page.get_by_role("button", name=re.compile("Accept|Agree|OK|Tout accepter|Autoriser", re.I)).click(timeout=3000)
+    except Exception:
+        pass
+
+async def extract_from_listing(page, url: str):
+    row = {
+        "url": url,
+        "title": "",
         "license_code": "",
         "host_name": "",
-        "host_profile_url": "",
         "host_overall_rating": "",
+        "host_profile_url": "",
         "host_joined": "",
-        "title": "",
-        "price_text": "",
+        "scraped_at": datetime.utcnow().isoformat(timespec="seconds"),
     }
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await click_cookies(page)
 
-    next_data = get_next_data_html(html)
-    if next_data:
-        # title
-        name = deep_find(next_data, {"name"})
-        if not name:
-            name = deep_find(next_data, {"listingname", "listing_name"})
-        data["title"] = clean(name)
-
-        # license
-        lic = deep_find(next_data, {"license"})
-        data["license_code"] = clean(lic)
-
-        # host info
-        host_name = deep_find(next_data, {"hostname", "host_name"})
-        if not host_name:
-            # sometimes under "user" object
-            host_name = deep_find(next_data, {"displayname", "hostdisplayname"})
-        data["host_name"] = clean(host_name)
-
-        # overall rating
-        rating = deep_find(next_data, {"overallrating", "starrating", "averagerating"})
+        # Titre
         try:
-            if isinstance(rating, dict) and "value" in rating:
-                rating = rating["value"]
-        except Exception:
-            pass
-        data["host_overall_rating"] = clean(rating)
-
-        # host joined
-        joined = deep_find(next_data, {"hostsince", "membersince", "member_since"})
-        data["host_joined"] = clean(joined)
-
-        # host profile url
-        profile_path = deep_find(next_data, {"profilepath"})
-        host_id = deep_find(next_data, {"hostid", "userid", "user_id"})
-        if profile_path:
-            data["host_profile_url"] = urljoin("https://www.airbnb.com", profile_path)
-        elif host_id:
-            try:
-                hid = str(host_id).split("?")[0]
-                data["host_profile_url"] = f"https://www.airbnb.com/users/show/{hid}"
-            except Exception:
-                pass
-
-        # price text (fallback best-effort)
-        price = deep_find(next_data, {"price", "displayprice", "priceitemdisplay"})
-        data["price_text"] = clean(price)
-
-    # LD+JSON fallback
-    if not data["title"] or not data["host_name"] or not data["host_overall_rating"]:
-        for block in get_ld_json_all(html):
-            if isinstance(block, dict):
-                if not data["title"]:
-                    data["title"] = clean(block.get("name") or block.get("headline"))
-                if not data["license_code"]:
-                    data["license_code"] = clean(block.get("license"))
-                aggr = block.get("aggregateRating") or {}
-                if not data["host_overall_rating"]:
-                    data["host_overall_rating"] = clean(aggr.get("ratingValue"))
-                offers = block.get("offers") or {}
-                if not data["price_text"]:
-                    data["price_text"] = clean(offers.get("price") or offers.get("priceSpecification", {}).get("price"))
-
-    return data
-
-def main():
-    results = []
-    with sync_playwright() as p:
-        launch_args = {
-            "headless": True,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-            "proxy": {"server": PROXY} if PROXY else None,
-        }
-        browser = p.chromium.launch(**{k:v for k,v in launch_args.items() if v is not None})
-        context = browser.new_context(
-            locale="fr-FR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width":1280, "height":900}
-        )
-        page = context.new_page()
-        page.set_default_timeout(15000)
-
-        # Page de recherche
-        page.goto(START_URL, wait_until="domcontentloaded")
-        # bannière cookies éventuelle
-        try:
-            page.get_by_role("button", name=re.compile("Accepter|Accept", re.I)).click(timeout=3000)
+            t = await page.locator("h1[data-testid='title'], h1").first.text_content()
+            row["title"] = normalize_whitespace(t)
         except Exception:
             pass
 
-        urls = collect_listing_urls(page, MAX_LISTINGS)
+        # Lien profil hôte + nom
+        host_link = None
+        try:
+            host_link = page.locator("a[data-testid='user-profile-link']").first
+            if not await host_link.count():
+                host_link = page.locator("a[href*='/users/show/']").first
+            if await host_link.count():
+                href = await host_link.get_attribute("href")
+                row["host_profile_url"] = urljoin("https://www.airbnb.com", href or "")
+                row["host_name"] = normalize_whitespace(await host_link.text_content() or "")
+        except Exception:
+            pass
 
-        start = time.time()
-        for url in urls:
-            if (time.time() - start) > MAX_MINUTES * 60:
-                break
-            row = {
-                "url": url,
-                "title": "",
-                "license_code": "",
-                "host_name": "",
-                "host_overall_rating": "",
-                "host_profile_url": "",
-                "host_joined": "",
-                "price_text": "",
-                "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            }
+        # Année d'inscription (dans le bloc hôte de l’annonce)
+        try:
+            txt = await page.inner_text("body", timeout=10000)
+            m = HOST_JOINED_PAT.search(txt or "")
+            if m:
+                row["host_joined"] = m.group(2)
+        except Exception:
+            pass
+
+        # Numéro de licence: chercher sur toute la page
+        try:
+            full = await page.inner_text("body", timeout=10000)
+            lic = extract_first(LICENSE_PATTERNS, full or "")
+            row["license_code"] = clean_license(lic)
+        except Exception:
+            pass
+
+        # Si besoin, tenter section “About this place” / “À propos”
+        if not row["license_code"]:
             try:
-                page.goto(url, wait_until="domcontentloaded")
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except PWTimeout:
-                    pass
-
-                html = page.content()
-                data = parse_from_structured(html)
-
-                for k in ["title","license_code","host_name","host_overall_rating","host_profile_url","host_joined","price_text"]:
-                    row[k] = data.get(k, "") or row[k]
-
-                # Titre de secours
-                if not row["title"]:
+                # ouvrir “Voir plus” pour déplier
+                for btn_text in ["Show more", "Voir plus", "Mehr anzeigen", "Ver más"]:
                     try:
-                        row["title"] = clean(page.title())
+                        await page.get_by_role("button", name=re.compile(btn_text, re.I)).click(timeout=1500)
                     except Exception:
                         pass
-
+                full = await page.inner_text("body", timeout=8000)
+                lic = extract_first(LICENSE_PATTERNS, full or "")
+                row["license_code"] = clean_license(lic)
             except Exception:
-                # on garde l’URL et la date pour diagnostic
                 pass
 
-            results.append(row)
+        # Note d'hôte: ouvrir le profil et extraire là-bas
+        if row["host_profile_url"]:
+            try:
+                # ouvrir profil dans le même onglet pour limiter l’empreinte
+                await page.goto(row["host_profile_url"], wait_until="domcontentloaded", timeout=60000)
+                await click_cookies(page)
+                prof_txt = await page.inner_text("body", timeout=10000)
+                # année d'inscription depuis le profil si absente
+                if not row["host_joined"]:
+                    m = HOST_JOINED_PAT.search(prof_txt or "")
+                    if m:
+                        row["host_joined"] = m.group(2)
+                # note d'hôte
+                host_rating = extract_first(RATING_PATTERNS, prof_txt or "")
+                if not host_rating:
+                    # fallback: première note décimale entourée de "reviews/avis" sur profil
+                    m = re.search(r"\b(\d\.\d)\b(?=[^\n]{0,30}(reviews|avis))", prof_txt or "", flags=re.I)
+                    if m:
+                        host_rating = m.group(1)
+                row["host_overall_rating"] = host_rating
+            except Exception:
+                pass
 
-        browser.close()
+    except Exception as e:
+        print("LISTING_ERROR", url, repr(e))
+    return row
 
-    # Écriture CSV avec BOM pour Excel
-    fieldnames = [
-        "url","title","license_code","host_name","host_overall_rating",
-        "host_profile_url","host_joined","price_text","scraped_at"
-    ]
-    with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(results)
+async def main():
+    pw = await async_playwright().start()
+    launch_args = ["--disable-blink-features=AutomationControlled"]
+    proxy_cfg = {"server": PROXY} if PROXY else None
+    browser = await pw.chromium.launch(headless=True, args=launch_args, proxy=proxy_cfg)
+    context = await browser.new_context(
+        viewport={"width": 1366, "height": 2200},
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118 Safari/537.36",
+        locale="en-US",  # langue stable
+        java_script_enabled=True,
+    )
+    page = await context.new_page()
+
+    # Page résultats: pas de dates, simple scroll
+    try:
+        await page.goto(START_URL, wait_until="domcontentloaded", timeout=60000)
+    except PWTimeout:
+        # fallback vers /stays
+        await page.goto(START_URL.replace("/homes", "/stays"), wait_until="domcontentloaded", timeout=60000)
+
+    await click_cookies(page)
+    urls = await collect_listing_urls(page, MAX_LISTINGS)
+    print(f"FOUND_URLS {len(urls)}")
+
+    results = []
+    for i, u in enumerate(urls, 1):
+        row = await extract_from_listing(page, u)
+        results.append(row)
+        print(f"[{i}/{len(urls)}] {row['url']} | host={row['host_name']} | lic={row['license_code']} | rating={row['host_overall_rating']}")
+    await browser.close()
+    await pw.stop()
+
+    # Écriture CSV sans prix
+    with open("airbnb_results.csv", "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "url",
+                "title",
+                "license_code",
+                "host_name",
+                "host_overall_rating",
+                "host_profile_url",
+                "host_joined",
+                "scraped_at",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(results)
+    print(f"SAVED {len(results)} rows to airbnb_results.csv")
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
