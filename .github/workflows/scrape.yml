@@ -9,11 +9,11 @@ on:
         required: true
       max_listings:
         description: "Nombre max d'annonces"
-        default: "10"
+        default: "20"
         required: true
       max_minutes:
         description: "Durée max (minutes)"
-        default: "10"
+        default: "60"
         required: true
       proxy:
         description: "Proxy (optionnel), ex: http://user:pass@host:port"
@@ -23,7 +23,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
